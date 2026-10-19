@@ -721,6 +721,10 @@ void Util::LogBuild()
 	else LOG(_T("SSE & AVX compatible CPU & OS detected"));
 	#endif
 }
+void Util::printLog(const String& log)
+{
+	LOG(log);
+}
 
 // print information about the memory usage
 #if _PLATFORM_X86

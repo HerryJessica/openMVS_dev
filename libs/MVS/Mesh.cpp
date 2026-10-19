@@ -3078,7 +3078,8 @@ void Mesh::ProjectOrtho(const Camera& camera, DepthMap& depthMap, Image8U3& imag
 				xt  = mesh.faceTexcoords[idxFaceTex+0] * bary[0];
 				xt += mesh.faceTexcoords[idxFaceTex+1] * bary[1];
 				xt += mesh.faceTexcoords[idxFaceTex+2] * bary[2];
-				auto texIdx = mesh.faceTexindices[idxFaceTex / 3];
+				//auto texIdx = mesh.faceTexindices[idxFaceTex / 3];
+				auto texIdx = mesh.GetFaceTextureIndex(idxFaceTex / 3);
 				image(pt) = mesh.texturesDiffuse[texIdx].sampleSafe(xt);
 			}
 		}

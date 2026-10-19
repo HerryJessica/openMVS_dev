@@ -160,9 +160,9 @@ private:
 	// Initialize SiftGPU context (returns false on failure)
 	bool Initialize() {
 		constexpr unsigned maxImageSize = 5120;
-		constexpr int firstOctave = -1;
-		constexpr int octaveResolution = 3;
-		constexpr unsigned maxNumOrientations = 2;
+		constexpr int firstOctave = 0;
+		constexpr int octaveResolution = 2;
+		constexpr unsigned maxNumOrientations = 1;
 		constexpr float peakThreshold = 0.005f;
 		constexpr float edgeThreshold = 20.f;
 		constexpr unsigned maxNumFeatures = 0; // 0 = no limit

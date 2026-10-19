@@ -18,7 +18,6 @@
 #include <dirent.h>
 #endif
 
-
 // D E F I N E S ///////////////////////////////////////////////////
 
 #define PATH_SEPARATOR _T('/')
@@ -45,7 +44,6 @@
 #define GET_TICK()		Util::getTick()
 #define GET_TIME()		Util::getTime()
 #define SIMD_ENABLED	Util::ms_CPUFNC
-
 
 namespace SEACAVE {
 
@@ -806,6 +804,7 @@ public:
 
 	static void		LogBuild();
 	static void		LogMemoryInfo();
+	static void		printLog(const String&);
 
 	struct MemoryInfo {
 		size_t totalPhysical;
@@ -865,7 +864,9 @@ public:
 			const float percentage((float)done/(float)total);
 			const Timer::Type remaining(percentage<0.01f && (done<10 || elapsed<10*1000) ? Timer::Type(0) : elapsed/percentage - elapsed);
 			// display progress
-			print(String::FormatString(_T("%s %u (%.2f%%, %s, ETA %s)..."), msg.c_str(), done, percentage*100.f, formatTime((int64_t)elapsed,1).c_str(), formatTime((int64_t)remaining,2).c_str()));
+			String log = String::FormatString(_T("%s %u (%.2f%%, %s, ETA %s)..."), msg.c_str(), done, percentage * 100.f, formatTime((int64_t)elapsed, 1).c_str(), formatTime((int64_t)remaining, 2).c_str());
+			print(log);
+			printLog(log);
 		}
 		void close() {
 			// make sure we print the complete progress

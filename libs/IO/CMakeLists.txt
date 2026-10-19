@@ -60,14 +60,62 @@ if(JPEG_FOUND)
 else()
 	SET(JPEG_LIBRARIES "")
 endif()
-FIND_PACKAGE(PkgConfig REQUIRED)
-pkg_check_modules_fullpath_libs(JPEGXL libjxl)
-if(JPEGXL_FOUND)
-	SET(_USE_JXL TRUE CACHE INTERNAL "")
-	set(JPEGXL_LIBRARIES ${JPEGXL_FULLPATH_LIBRARIES})
+# FIND_PACKAGE(PkgConfig REQUIRED)
+# ---- libjxl 检测 ----
+# 优先尝试手动路径（Windows MSVC 场景）
+set(JPEGXL_ROOT "E:/HerryProj/install/libjxl-0.11.1" CACHE PATH "Root directory of libjxl installation")
+
+if(WIN32 AND JPEGXL_ROOT)
+    # 直接用用户指定路径，跳过 pkg-config
+    find_path(JPEGXL_INCLUDE_DIR
+        NAMES jxl/decode.h jxl/version.h
+        PATHS "${JPEGXL_ROOT}/include"
+        NO_DEFAULT_PATH
+    )
+    find_library(JPEGXL_LIB_JXL
+        NAMES jxl
+        PATHS "${JPEGXL_ROOT}/lib"
+        NO_DEFAULT_PATH
+    )
+    find_library(JPEGXL_LIB_CMS
+        NAMES jxl_cms
+        PATHS "${JPEGXL_ROOT}/lib"
+        NO_DEFAULT_PATH
+    )
+    find_library(JPEGXL_LIB_THREADS
+        NAMES jxl_threads
+        PATHS "${JPEGXL_ROOT}/lib"
+        NO_DEFAULT_PATH
+    )
+
+    if(JPEGXL_INCLUDE_DIR AND JPEGXL_LIB_JXL AND JPEGXL_LIB_CMS AND JPEGXL_LIB_THREADS)
+        set(JPEGXL_FOUND TRUE)
+        set(JPEGXL_LIBRARIES
+            "${JPEGXL_LIB_JXL}"
+            "${JPEGXL_LIB_CMS}"
+            "${JPEGXL_LIB_THREADS}"
+        )
+        include_directories("${JPEGXL_INCLUDE_DIR}")
+        SET(_USE_JXL TRUE CACHE INTERNAL "")
+        message(STATUS "Found libjxl (manual): ${JPEGXL_LIBRARIES}")
+    else()
+        set(JPEGXL_FOUND FALSE)
+        SET(JPEGXL_LIBRARIES "")
+        message(STATUS "libjxl not found at JPEGXL_ROOT=${JPEGXL_ROOT}")
+    endif()
+
 else()
-	SET(JPEGXL_LIBRARIES "")
+    # Linux / 没有指定 JPEGXL_ROOT 时走 pkg-config 原有逻辑
+    pkg_check_modules_fullpath_libs(JPEGXL libjxl)
+    if(JPEGXL_FOUND)
+        SET(_USE_JXL TRUE CACHE INTERNAL "")
+        set(JPEGXL_LIBRARIES ${JPEGXL_FULLPATH_LIBRARIES})
+        include_directories(${JPEGXL_INCLUDE_DIRS})
+    else()
+        SET(JPEGXL_LIBRARIES "")
+    endif()
 endif()
+# ---- libjxl 检测结束 ----
 FIND_PACKAGE(TIFF QUIET)
 if(TIFF_FOUND)
 	INCLUDE_DIRECTORIES(${TIFF_INCLUDE_DIR})

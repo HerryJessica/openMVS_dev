@@ -184,6 +184,7 @@ if(OpenMVS_USE_CUDA)
 			# Build for maximum compatibility
 			# https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
 			UNSET(CMAKE_CUDA_ARCHITECTURES)
+			SET(CMAKE_CUDA_ARCHITECTURES OFF) 
 			# Extract list of arch and gencodes
 			STRING(REPLACE "\r" "" LIST_GPU_ARCH ${LIST_GPU_ARCH})
 			STRING(REPLACE "\n" ";" LIST_GPU_ARCH ${LIST_GPU_ARCH})
@@ -241,7 +242,10 @@ if(OpenMVS_USE_PYTHON)
 		MESSAGE(STATUS "Can't find Python. Continuing without it.")
 	endif()
 endif()
-
+SET(Boost_USE_STATIC_LIBS OFF)
+SET(Boost_USE_MULTITHREADED ON)
+SET(Boost_USE_STATIC_RUNTIME OFF)
+ADD_DEFINITIONS(-DBOOST_ALL_DYN_LINK)
 FIND_PACKAGE(Boost REQUIRED COMPONENTS iostreams program_options system serialization OPTIONAL_COMPONENTS ${Boost_EXTRA_COMPONENTS})
 if(Boost_FOUND)
 	ADD_DEFINITIONS(${Boost_DEFINITIONS})

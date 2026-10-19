@@ -5,6 +5,10 @@
  */
 
 // Include Eigen before OpenCV to avoid header ordering issues
+
+#ifdef ERROR
+	#undef ERROR
+#endif
 #include "Common.h"
 #include "BundleAdjustment.h"
 #include "Scene.h"
@@ -416,15 +420,23 @@ bool BundleAdjustment::Adjust(Scene& scene, const BAConfig& config)
 	// Configure solver
 	ceres::Solver::Options options;
 	if (numReprojResiduals < 500000) {
+		// Small problem: DENSE_SCHUR is fastest
 		options.linear_solver_type = ceres::DENSE_SCHUR;
-		options.preconditioner_type = ceres::IDENTITY; // Not used with DENSE_SCHUR
 	} else {
-		// For large problems, use SPARSE_SCHUR or ITERATIVE_SCHUR
-		// Use ITERATIVE_SCHUR for better numerical stability, especially on macOS Apple Accelerate
-		// SPARSE_SCHUR can fail with "Numeric factorisation failed" on poorly conditioned problems
-		options.linear_solver_type = ceres::ITERATIVE_SCHUR;
-		options.preconditioner_type = ceres::SCHUR_JACOBI; // Robust preconditioner
-		options.use_inner_iterations = true; // Improves convergence
+		// Large problem: prefer SPARSE_SCHUR (direct Cholesky, ls_iter=1)
+		// Falls back to ITERATIVE_SCHUR if no sparse library available
+		if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::SUITE_SPARSE)) {
+			options.linear_solver_type = ceres::SPARSE_SCHUR;
+			options.sparse_linear_algebra_library_type = ceres::SUITE_SPARSE;
+		} else if (ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::EIGEN_SPARSE)) {
+			options.linear_solver_type = ceres::SPARSE_SCHUR;
+			options.sparse_linear_algebra_library_type = ceres::EIGEN_SPARSE;
+		} else {
+			// No sparse library: fall back to ITERATIVE_SCHUR
+			options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+			options.preconditioner_type = ceres::SCHUR_JACOBI;
+			options.use_inner_iterations = true;
+		}
 	}
 	#ifndef _RELEASE
 	options.minimizer_progress_to_stdout = true;
@@ -439,6 +451,16 @@ bool BundleAdjustment::Adjust(Scene& scene, const BAConfig& config)
 	ceres::Solver::Summary summary;
 	ceres::Solve(options, &problem, &summary);
 	DEBUG("BA Summary: %s", summary.BriefReport().c_str());
+	// If SPARSE_SCHUR fails with numeric factorization error, retry with ITERATIVE_SCHUR
+	if (!summary.IsSolutionUsable() && options.linear_solver_type == ceres::SPARSE_SCHUR) {
+		VERBOSE("warning: SPARSE_SCHUR failed (%s), retrying with ITERATIVE_SCHUR",
+		        summary.message.c_str());
+		options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+		options.preconditioner_type = ceres::SCHUR_JACOBI;
+		options.use_inner_iterations = true;
+		ceres::Solve(options, &problem, &summary);
+		DEBUG("BA Summary (retry): %s", summary.BriefReport().c_str());
+	}
 	if (!summary.IsSolutionUsable()) {
 		VERBOSE("error: bundle adjustment failed");
 		return false;

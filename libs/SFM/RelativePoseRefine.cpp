@@ -16,6 +16,11 @@
 #undef VERBOSE
 #pragma push_macro("LOG")
 #undef LOG
+
+#ifdef ERROR
+	#undef ERROR
+#endif
+
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 #pragma pop_macro("VERBOSE")

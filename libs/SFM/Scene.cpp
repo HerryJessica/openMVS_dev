@@ -197,6 +197,7 @@ bool Scene::Import(const String& source, const ImportConfig& config)
 			const String ext = String(entry.path().extension().string()).ToLower();
 			if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".tif" || ext == ".tiff" || ext == ".jxl" || ext == ".exr" || ext == ".webp")
 				imageFiles.emplace_back(entry.path().string());
+
 		}
 		if (!imageFiles.empty()) {
 			// Sort files by path or numeric stem if possible
@@ -932,6 +933,16 @@ bool Scene::UndistortImages(String outputDir, String extension, float alpha,
 		const Image& img = images[i];
 		if (!img.IsValid())
 			continue;
+
+		// 优化重复去畸变
+		const String stem = Util::getFileName(img.fileName);
+		const String outPath = outputDir + stem + extension;
+		if (File::isFile(outPath)) {
+			if (outImagePaths)
+				(*outImagePaths)[i] = outPath;
+			continue;
+		}
+
 		bool loadedHere = false;
 		if (!img.HasPixels()) {
 			const_cast<Image&>(img).LoadPixels();
@@ -947,8 +958,8 @@ bool Scene::UndistortImages(String outputDir, String extension, float alpha,
 			const_cast<Image&>(img).ReleasePixels();
 		// Restore original orientation if the working copy was rotated to landscape
 		undistorted = img.ToOriginalOrientation(undistorted);
-		const String stem = Util::getFileName(img.fileName);
-		const String outPath = outputDir + stem + extension;
+		// const String stem = Util::getFileName(img.fileName);  ← 删掉原来这行
+		// const String outPath = outputDir + stem + extension;  ← 删掉原来这行
 		if (SaveImage(undistorted, outPath) && outImagePaths)
 			(*outImagePaths)[i] = outPath;
 	}

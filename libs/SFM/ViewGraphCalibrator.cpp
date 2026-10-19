@@ -17,6 +17,11 @@
 #undef CHECK
 #pragma push_macro("DEBUG_EXTRA")
 #undef DEBUG_EXTRA
+
+#ifdef ERROR
+	#undef ERROR
+#endif
+
 #include <ceres/ceres.h>
 #pragma pop_macro("DEBUG_EXTRA")
 #pragma pop_macro("CHECK")

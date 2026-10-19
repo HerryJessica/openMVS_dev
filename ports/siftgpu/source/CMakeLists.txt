@@ -75,6 +75,43 @@ if(CUDA_ENABLED)
   list(APPEND COMPILE_DEFINITIONS SIFTGPU_CUDA=1 CUDA_SIFTGPU_ENABLED)
   list(APPEND OPTIONAL_LINK_LIBS CUDA::cudart CUDA::curand)
   message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
+
+  if(true)
+			EXECUTE_PROCESS(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-arch
+				OUTPUT_VARIABLE LIST_GPU_ARCH
+				ERROR_QUIET)
+			if(NOT LIST_GPU_ARCH)
+				MESSAGE(WARNING "Cannot compile for max CUDA compatibility, nvcc does not support --list-gpu-arch")
+				SET(OpenMVS_MAX_CUDA_COMPATIBILITY OFF)
+			endif()
+	endif()
+
+  if(true)
+			# Build for maximum compatibility
+			# https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
+			UNSET(CMAKE_CUDA_ARCHITECTURES)
+			SET(CMAKE_CUDA_ARCHITECTURES OFF) 
+			# Extract list of arch and gencodes
+			STRING(REPLACE "\r" "" LIST_GPU_ARCH ${LIST_GPU_ARCH})
+			STRING(REPLACE "\n" ";" LIST_GPU_ARCH ${LIST_GPU_ARCH})
+			EXECUTE_PROCESS(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
+				OUTPUT_VARIABLE LIST_GPU_CODE
+				ERROR_QUIET)
+			STRING(REPLACE "\r" "" LIST_GPU_CODE ${LIST_GPU_CODE})
+			STRING(REPLACE "\n" ";" LIST_GPU_CODE ${LIST_GPU_CODE})
+			LIST(GET LIST_GPU_CODE 0 TARGET_GPU_CODE)
+			SET(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=${TARGET_GPU_CODE}")
+			SET(IDX 0)
+			foreach(GPU_ARCH ${LIST_GPU_ARCH})
+				LIST(GET LIST_GPU_CODE ${IDX} GPU_CODE)
+				SET(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=${GPU_ARCH},code=${GPU_CODE}")
+				MATH(EXPR IDX "${IDX}+1")
+			endforeach()
+			MESSAGE(STATUS "Set CUDA flags: " ${CMAKE_CUDA_FLAGS})
+		endif()
+		SET(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+		SET(CMAKE_CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+		SET(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 endif()
 
 # DevIL (optional)

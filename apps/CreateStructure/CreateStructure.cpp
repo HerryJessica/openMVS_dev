@@ -217,7 +217,6 @@ void Application::Finalize()
 }
 
 } // namespace
-
 int main(int argc, LPCTSTR* argv)
 {
 	#ifdef _DEBUGINFO
