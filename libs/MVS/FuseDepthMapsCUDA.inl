@@ -66,8 +66,9 @@ struct FusionProposal
 // Entry in the per-fusion view pool.
 struct ViewEntry
 {
-	IIndex idxImage;
+	IIndex neighborIndex; // NO_ID identifies the reference image; otherwise indexes the neighbor array
 	float weight;
+	uint32_t pixelIndex;
 };
 
 // ---------------------------------------------------------------------------
@@ -84,10 +85,19 @@ void launchFuseProposal(
     unsigned nMinViewsFuse,
     FusionProposal* d_proposals,
     ViewEntry* d_viewPool,
-    uint32_t* d_viewPoolCounter,
-    unsigned refIdx,
+    uint32_t* d_counts,
     int W,
     int H,
+    cudaStream_t stream);
+
+void launchClaimViews(
+    const GpuDepthData& ref,
+    FusionProposal* d_proposals,
+    const ViewEntry* d_viewPool,
+    GpuNeighborView* d_neighbors,
+    int N,
+    int nPixels,
+    uint32_t* d_counts,
     cudaStream_t stream);
 
 void launchApplyInvalid(
@@ -97,13 +107,16 @@ void launchApplyInvalid(
     const FusionProposal* d_proposals,
     float depthThresh,
     float normalCosThresh,
+    uint32_t* d_counts,
     cudaStream_t stream);
 
 void launchSelectValid(
     const FusionProposal* d_in,
     int n,
+    const ViewEntry* d_viewPool,
     FusionProposal* d_out,
-    int* d_numOut,
+    ViewEntry* d_outViewPool,
+    uint32_t* d_counts,
     cudaStream_t stream);
 
 } // namespace MVS

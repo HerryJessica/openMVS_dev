@@ -1640,7 +1640,15 @@ bool DepthMapsData::FuseDepthMapsCUDA_Exec(PointCloud& pointcloud, bool bEstimat
 	// Device memory budget: ~70% of current free VRAM.
 	{
 		size_t freeMem = 0, totalMem = 0;
-		cudaMemGetInfo(&freeMem, &totalMem);
+		cudaError_t status = cudaMemGetInfo(&freeMem, &totalMem);
+		if (status != cudaSuccess) {
+			VERBOSE("warning: unable to query CUDA memory (%s); falling back to CPU fusion",
+			        cudaGetErrorString(status));
+			fuseCUDA->Release();
+			fuseCUDA.Release();
+			FuseDepthMaps(pointcloud, bEstimateColor, bEstimateNormal);
+			return true;
+		}
 		fuseCUDA->SetMaxMemory((size_t)(freeMem * 0.7));
 	}
 
@@ -1691,16 +1699,9 @@ bool DepthMapsData::FuseDepthMapsCUDA_Exec(PointCloud& pointcloud, bool bEstimat
 			continue;
 		}
 
-		if (!fuseCUDA->UploadDepthData(idxImage,
-		                               depthData.depthMap, depthData.normalMap, depthData.confMap,
-		                               depthData.GetView().camera, bEstimateNormal)) {
-			bFallbackToCPU = true;
-			break;
-		}
-
-		// Upload as many valid neighbors as possible.
+		// Load the exact neighbor set first so the CUDA cache can pin this batch
+		// while evicting depth-maps that are no longer needed.
 		IIndexArr validNeighbors;
-		unsigned nbCount = 0;
 		for (const ViewScore& nb : depthData.neighbors) {
 			if (!arrDepthData[nb.ID].IsValid())
 				continue;
@@ -1711,13 +1712,42 @@ bool DepthMapsData::FuseDepthMapsCUDA_Exec(PointCloud& pointcloud, bool bEstimat
 				EstimateNormalMaps();
 			if (dnb.depthMap.empty())
 				continue;
-			if (fuseCUDA->UploadDepthData(nb.ID,
-			                              dnb.depthMap, dnb.normalMap, dnb.confMap,
-			                              dnb.GetView().camera, bEstimateNormal)) {
-				validNeighbors.push_back(nb.ID);
-				if (++nbCount >= OPTDENSE::nMaxViewsFuse)
-					break;
-			} else {
+			validNeighbors.push_back(nb.ID);
+			if (validNeighbors.size() >= OPTDENSE::nMaxViewsFuse)
+				break;
+		}
+
+		if (validNeighbors.size() + 1 < nMinViewsFuse) {
+			bFallbackToCPU = true;
+			break;
+		}
+
+		IIndexArr noPinnedImages;
+		fuseCUDA->SetPinnedImages(noPinnedImages);
+		if (!fuseCUDA->PrepareFusionBuffers((size_t)depthData.depthMap.size().area(),
+		                                    validNeighbors.size())) {
+			VERBOSE("CUDA fusion: unable to reserve per-image working buffers; falling back to CPU fusion");
+			bFallbackToCPU = true;
+			break;
+		}
+
+		IIndexArr pinnedImages;
+		pinnedImages.push_back(idxImage);
+		for (const IIndex idxNeighbor : validNeighbors)
+			pinnedImages.push_back(idxNeighbor);
+		fuseCUDA->SetPinnedImages(pinnedImages);
+
+		if (!fuseCUDA->UploadDepthData(idxImage,
+		                               depthData.depthMap, depthData.normalMap, depthData.confMap,
+		                               depthData.GetView().camera, bEstimateNormal)) {
+			bFallbackToCPU = true;
+			break;
+		}
+		for (const IIndex idxNeighbor : validNeighbors) {
+			DepthData& dnb = arrDepthData[idxNeighbor];
+			if (!fuseCUDA->UploadDepthData(idxNeighbor,
+			                               dnb.depthMap, dnb.normalMap, dnb.confMap,
+			                               dnb.GetView().camera, bEstimateNormal)) {
 				bFallbackToCPU = true;
 				break;
 			}
@@ -1725,14 +1755,10 @@ bool DepthMapsData::FuseDepthMapsCUDA_Exec(PointCloud& pointcloud, bool bEstimat
 		if (bFallbackToCPU)
 			break;
 
-		if (validNeighbors.size() + 1 < nMinViewsFuse) {
-			bFallbackToCPU = true;
-			break;
-		}
-
 		totalNeighbors += (unsigned)validNeighbors.size();
 
 
+		const size_t nPointsBefore = pointcloud.points.size();
 		if (!fuseCUDA->FuseOne(idxImage, validNeighbors, nMinViewsFuse,
 		                       depthThresh, normalError,
 		                       bEstimateColor, bEstimateNormal,
@@ -1744,12 +1770,14 @@ bool DepthMapsData::FuseDepthMapsCUDA_Exec(PointCloud& pointcloud, bool bEstimat
 		fusedDMaps[idxImage] = true;
 		progress.display(numDMapsFused + 1);
 
-		DEBUG_ULTIMATE("GPU-fused depth-map for reference image %3u: %u neighbors (%s)",
-		               idxImage, (unsigned)validNeighbors.size(), TD_TIMER_GET_FMT().c_str());
+		DEBUG_ULTIMATE("GPU-fused depth-map for reference image %3u: %u neighbors, %u new points (%s)",
+		               idxImage, (unsigned)validNeighbors.size(),
+		               (unsigned)(pointcloud.points.size() - nPointsBefore), TD_TIMER_GET_FMT().c_str());
 	}
 
 	GET_LOGCONSOLE().Play();
 	progress.close();
+	const size_t gpuMemoryUsed = fuseCUDA->GetUsedMemory();
 	fuseCUDA->Release();
 
 	if (bFallbackToCPU || pointcloud.points.empty()) {
@@ -1759,9 +1787,10 @@ bool DepthMapsData::FuseDepthMapsCUDA_Exec(PointCloud& pointcloud, bool bEstimat
 		return true;
 	}
 
-	DEBUG_EXTRA("GPU depth-maps fused: %u depth-maps, %u points, avg %.2f neighbors (%s)",
+	DEBUG_EXTRA("GPU depth-maps fused: %u depth-maps, %u points, avg %.2f neighbors, %llu MB managed GPU memory at completion (%s)",
 	            numDMapsFused, pointcloud.points.size(),
 	            numDMapsFused ? (double)totalNeighbors / numDMapsFused : 0.0,
+	            (unsigned long long)(gpuMemoryUsed / (1024 * 1024)),
 	            TD_TIMER_GET_FMT().c_str());
 	return true;
 }

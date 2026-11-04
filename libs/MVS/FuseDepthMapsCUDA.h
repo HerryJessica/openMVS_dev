@@ -42,6 +42,8 @@ class FuseDepthMapsCUDA
 
 	void SetPinnedImages(const IIndexArr& idxImages);
 	bool IsCached(IIndex idxImage) const;
+	// Reserve the complete per-image workspace before pinning depth-maps.
+	bool PrepareFusionBuffers(size_t nPixels, size_t nNeighbors);
 
 	// Fuse one reference depth-map into `pointcloud`.
 	bool FuseOne(IIndex idxImage,

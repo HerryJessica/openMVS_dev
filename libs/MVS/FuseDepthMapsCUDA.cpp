@@ -11,8 +11,12 @@
 #ifdef _USE_CUDA
 
 	#include <cuda_runtime.h>
+	#include <algorithm>
 	#include <unordered_map>
+	#include <unordered_set>
 	#include <list>
+	#include <climits>
+	#include <limits>
 	#include <mutex>
 	#include <vector>
 
@@ -22,20 +26,30 @@ using namespace MVS;
 
 struct FuseDepthMapsCUDA::Impl
 {
+	struct HostDepthState
+	{
+		std::vector<uint8_t> claimed;
+		std::vector<uint8_t> invalid;
+	};
+
 	std::unordered_map<IIndex, GpuDepthData> cache;
+	std::unordered_map<IIndex, HostDepthState> hostDepthState;
+	std::unordered_set<SEACAVE::PairIdx> outputObservations;
+	std::unordered_set<IIndex> pinnedImages;
+	std::unordered_set<IIndex> touchedImages;
 	std::list<IIndex> lru; // front = most recently used
 	mutable std::mutex mtx;
 	size_t maxMemory = 2ull * 1024 * 1024 * 1024; // 2 GB
 	size_t usedMemory = 0;
+	size_t temporaryMemory = 0;
 	bool inited = false;
 
 	FusionProposal* d_proposals = nullptr;
-
 	ViewEntry* d_viewPool = nullptr;
-	uint32_t* d_viewPoolCounter = nullptr;
-	int2* d_invalidDepths = nullptr;
-	uint32_t* d_invalidCount = nullptr;
-	size_t capProposals = 0, capViewPool = 0, capInvalid = 0;
+	FusionProposal* d_out = nullptr;
+	ViewEntry* d_outViewPool = nullptr;
+	uint32_t* d_counts = nullptr;
+	size_t capProposals = 0, capViewPool = 0, capOut = 0, capOutViewPool = 0, capCounts = 0;
 
 	void FreeGpu(GpuDepthData& d)
 	{
@@ -45,65 +59,105 @@ struct FuseDepthMapsCUDA::Impl
 			cudaFree(d.d_normal);
 		if (d.d_conf)
 			cudaFree(d.d_conf);
-		if (d.ownsDepthIndex && d.d_depthIndex)
+		if (d.d_depthIndex)
 			cudaFree(d.d_depthIndex);
 		d = GpuDepthData{};
 	}
 
-	bool EnsureTempCap(size_t nPix, size_t nViews, size_t nInvalid)
+	size_t DepthDataBytes(const GpuDepthData& d) const
 	{
-		if (nPix > capProposals) {
-			if (d_proposals)
-				cudaFree(d_proposals);
-			d_proposals = nullptr;
-			capProposals = 0;
-			if (cudaMalloc(&d_proposals, nPix * sizeof(FusionProposal)) != cudaSuccess) {
-				VERBOSE("CUDA fusion: failed to allocate proposal buffer");
-				return false;
-			}
-			capProposals = nPix;
+		const size_t nPixels = (size_t)d.width * (size_t)d.height;
+		return nPixels * (sizeof(float) + sizeof(uint32_t) +
+			(d.d_normal ? 3 * sizeof(float) : 0) +
+			(d.d_conf ? sizeof(float) : 0));
+	}
+
+	bool StoreDepthState(IIndex idxImage, const GpuDepthData& d)
+	{
+		const size_t nPixels = (size_t)d.width * (size_t)d.height;
+		std::vector<float> depths(nPixels);
+		std::vector<uint32_t> claims(nPixels);
+		cudaError_t status = cudaMemcpy(depths.data(), d.d_depth, nPixels * sizeof(float), cudaMemcpyDeviceToHost);
+		if (status == cudaSuccess)
+			status = cudaMemcpy(claims.data(), d.d_depthIndex, nPixels * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+		if (status != cudaSuccess) {
+			VERBOSE("CUDA fusion: failed to preserve cached image %u before eviction: %s",
+			        idxImage, cudaGetErrorString(status));
+			return false;
 		}
-		if (nViews > capViewPool) {
-			if (d_viewPool)
-				cudaFree(d_viewPool);
-			if (d_viewPoolCounter)
-				cudaFree(d_viewPoolCounter);
-			d_viewPool = nullptr;
-			d_viewPoolCounter = nullptr;
-			capViewPool = 0;
-			if (cudaMalloc(&d_viewPool, nViews * sizeof(ViewEntry)) != cudaSuccess) {
-				VERBOSE("CUDA fusion: failed to allocate view-pool buffer");
-				return false;
-			}
-			if (cudaMalloc(&d_viewPoolCounter, sizeof(uint32_t)) != cudaSuccess) {
-				cudaFree(d_viewPool);
-				d_viewPool = nullptr;
-				VERBOSE("CUDA fusion: failed to allocate view-pool counter");
-				return false;
-			}
-			capViewPool = nViews;
+
+		HostDepthState state;
+		state.claimed.assign((nPixels + 7) / 8, 0);
+		state.invalid.assign((nPixels + 7) / 8, 0);
+		for (size_t i = 0; i < nPixels; ++i) {
+			const uint8_t mask = (uint8_t)(1u << (i & 7));
+			if (claims[i] != 0xFFFFFFFFu)
+				state.claimed[i >> 3] |= mask;
+			if (depths[i] == 0.f)
+				state.invalid[i >> 3] |= mask;
 		}
-		if (nInvalid > capInvalid) {
-			if (d_invalidDepths)
-				cudaFree(d_invalidDepths);
-			if (d_invalidCount)
-				cudaFree(d_invalidCount);
-			d_invalidDepths = nullptr;
-			d_invalidCount = nullptr;
-			capInvalid = 0;
-			if (cudaMalloc(&d_invalidDepths, nInvalid * sizeof(int2)) != cudaSuccess) {
-				VERBOSE("CUDA fusion: failed to allocate invalid-depth buffer");
+		hostDepthState.insert_or_assign(idxImage, std::move(state));
+		return true;
+	}
+
+	bool TrimCache(size_t additionalBytes)
+	{
+		if (additionalBytes > maxMemory)
+			return false;
+		while (usedMemory > maxMemory - additionalBytes ||
+		       temporaryMemory > maxMemory - additionalBytes - usedMemory) {
+			auto itLRU = lru.rbegin();
+			while (itLRU != lru.rend() && pinnedImages.count(*itLRU))
+				++itLRU;
+			if (itLRU == lru.rend())
 				return false;
+			const IIndex idxImage = *itLRU;
+			auto it = cache.find(idxImage);
+			if (it != cache.end()) {
+				if (touchedImages.count(idxImage) && !StoreDepthState(idxImage, it->second))
+					return false;
+				usedMemory -= DepthDataBytes(it->second);
+				FreeGpu(it->second);
+				cache.erase(it);
 			}
-			if (cudaMalloc(&d_invalidCount, sizeof(uint32_t)) != cudaSuccess) {
-				cudaFree(d_invalidDepths);
-				d_invalidDepths = nullptr;
-				VERBOSE("CUDA fusion: failed to allocate invalid-depth counter");
-				return false;
-			}
-			capInvalid = nInvalid;
+			touchedImages.erase(idxImage);
+			lru.remove(idxImage);
 		}
 		return true;
+	}
+
+	template <typename T>
+	bool EnsureBuffer(T*& pBuffer, size_t& capacity, size_t required, const char* name)
+	{
+		if (required <= capacity)
+			return true;
+		if (pBuffer) {
+			cudaFree(pBuffer);
+			temporaryMemory -= capacity * sizeof(T);
+			pBuffer = nullptr;
+			capacity = 0;
+		}
+		if (required > std::numeric_limits<size_t>::max() / sizeof(T) ||
+		    !TrimCache(required * sizeof(T))) {
+			VERBOSE("CUDA fusion: memory budget cannot fit %s buffer", name);
+			return false;
+		}
+		if (cudaMalloc(&pBuffer, required * sizeof(T)) != cudaSuccess) {
+			VERBOSE("CUDA fusion: failed to allocate %s buffer", name);
+			return false;
+		}
+		capacity = required;
+		temporaryMemory += capacity * sizeof(T);
+		return true;
+	}
+
+	bool EnsureTempCap(size_t nPix, size_t nViews)
+	{
+		return EnsureBuffer(d_proposals, capProposals, nPix, "proposal") &&
+		       EnsureBuffer(d_viewPool, capViewPool, nViews, "view-pool") &&
+		       EnsureBuffer(d_out, capOut, nPix, "output proposal") &&
+		       EnsureBuffer(d_outViewPool, capOutViewPool, nViews, "output view-pool") &&
+		       EnsureBuffer(d_counts, capCounts, 6, "fusion counters");
 	}
 };
 
@@ -139,28 +193,35 @@ void FuseDepthMapsCUDA::Release()
 	for (auto& kv : impl_->cache)
 		impl_->FreeGpu(kv.second);
 	impl_->cache.clear();
+	impl_->hostDepthState.clear();
+	impl_->outputObservations.clear();
+	impl_->touchedImages.clear();
+	impl_->pinnedImages.clear();
 	impl_->lru.clear();
 
 	if (impl_->d_proposals)
 		cudaFree(impl_->d_proposals);
 	if (impl_->d_viewPool)
 		cudaFree(impl_->d_viewPool);
-	if (impl_->d_viewPoolCounter)
-		cudaFree(impl_->d_viewPoolCounter);
-	if (impl_->d_invalidDepths)
-		cudaFree(impl_->d_invalidDepths);
-	if (impl_->d_invalidCount)
-		cudaFree(impl_->d_invalidCount);
+	if (impl_->d_out)
+		cudaFree(impl_->d_out);
+	if (impl_->d_outViewPool)
+		cudaFree(impl_->d_outViewPool);
+	if (impl_->d_counts)
+		cudaFree(impl_->d_counts);
 
 	impl_->d_proposals = nullptr;
 	impl_->d_viewPool = nullptr;
-	impl_->d_viewPoolCounter = nullptr;
-	impl_->d_invalidDepths = nullptr;
-	impl_->d_invalidCount = nullptr;
+	impl_->d_out = nullptr;
+	impl_->d_outViewPool = nullptr;
+	impl_->d_counts = nullptr;
 	impl_->capProposals = 0;
 	impl_->capViewPool = 0;
-	impl_->capInvalid = 0;
+	impl_->capOut = 0;
+	impl_->capOutViewPool = 0;
+	impl_->capCounts = 0;
 	impl_->usedMemory = 0;
+	impl_->temporaryMemory = 0;
 	impl_->inited = false;
 }
 
@@ -190,38 +251,87 @@ bool FuseDepthMapsCUDA::UploadDepthData(
 	GpuDepthData g{};
 	g.width = depthMap.cols;
 	g.height = depthMap.rows;
-	g.ownsDepthIndex = true;
 	const size_t nPix = (size_t)g.width * (size_t)g.height;
+	const bool bHasNormal = bNeedNormal && !normalMap.empty();
+	const bool bHasConfidence = !confMap.empty();
+	const size_t bytesPerPixel = sizeof(float) + sizeof(uint32_t) +
+		(bHasNormal ? 3 * sizeof(float) : 0) +
+		(bHasConfidence ? sizeof(float) : 0);
+	if (nPix > std::numeric_limits<size_t>::max() / bytesPerPixel ||
+	    !impl_->TrimCache(nPix * bytesPerPixel)) {
+		VERBOSE("CUDA fusion: depth-map exceeds the available GPU memory budget");
+		return false;
+	}
+
+	auto stateIt = impl_->hostDepthState.find(idxImage);
+	std::vector<float> restoredDepth;
+	std::vector<uint32_t> restoredClaims;
+	if (stateIt != impl_->hostDepthState.end()) {
+		const size_t bitsetSize = (nPix + 7) / 8;
+		if (stateIt->second.invalid.size() != bitsetSize ||
+		    stateIt->second.claimed.size() != bitsetSize) {
+			VERBOSE("CUDA fusion: saved depth state size mismatch for image %u", idxImage);
+			return false;
+		}
+		restoredDepth.resize(nPix);
+		for (int y = 0; y < depthMap.rows; ++y)
+			std::copy(depthMap.cv::Mat::ptr<Depth>(y),
+			          depthMap.cv::Mat::ptr<Depth>(y) + depthMap.cols,
+			          restoredDepth.begin() + (size_t)y * depthMap.cols);
+		restoredClaims.assign(nPix, 0xFFFFFFFFu);
+		for (size_t i = 0; i < nPix; ++i) {
+			const uint8_t mask = (uint8_t)(1u << (i & 7));
+			if (stateIt->second.invalid[i >> 3] & mask)
+				restoredDepth[i] = 0.f;
+			if (stateIt->second.claimed[i >> 3] & mask)
+				restoredClaims[i] = 0;
+		}
+	}
 
 	auto allocCopy = [&](const void* src, void** dst, size_t bytes) -> bool {
-		if (cudaMalloc(dst, bytes) != cudaSuccess)
+		cudaError_t status = cudaMalloc(dst, bytes);
+		if (status != cudaSuccess) {
+			VERBOSE("CUDA fusion: depth-map allocation failed: %s", cudaGetErrorString(status));
 			return false;
-		if (src && cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+		}
+		if (src && (status = cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice)) != cudaSuccess) {
+			VERBOSE("CUDA fusion: depth-map upload failed: %s", cudaGetErrorString(status));
 			return false;
+		}
 		return true;
 	};
 
-	if (!allocCopy(depthMap.ptr(), (void**)&g.d_depth, nPix * sizeof(float))) {
+	const void* pDepth = restoredDepth.empty()
+		? static_cast<const void*>(depthMap.ptr())
+		: static_cast<const void*>(restoredDepth.data());
+	if (!allocCopy(pDepth, (void**)&g.d_depth, nPix * sizeof(float))) {
 		impl_->FreeGpu(g);
 		return false;
 	}
-	if (bNeedNormal && !normalMap.empty()) {
+	if (bHasNormal) {
 		if (!allocCopy(normalMap.ptr(), (void**)&g.d_normal, nPix * 3 * sizeof(float))) {
 			impl_->FreeGpu(g);
 			return false;
 		}
 	}
-	if (!confMap.empty()) {
+	if (bHasConfidence) {
 		if (!allocCopy(confMap.ptr(), (void**)&g.d_conf, nPix * sizeof(float))) {
 			impl_->FreeGpu(g);
 			return false;
 		}
 	}
-	if (cudaMalloc(&g.d_depthIndex, nPix * sizeof(uint32_t)) != cudaSuccess) {
+	cudaError_t status = cudaMalloc(&g.d_depthIndex, nPix * sizeof(uint32_t));
+	if (status != cudaSuccess) {
+		VERBOSE("CUDA fusion: depth-pixel claim allocation failed: %s", cudaGetErrorString(status));
 		impl_->FreeGpu(g);
 		return false;
 	}
-	if (cudaMemset(g.d_depthIndex, 0xFF, nPix * sizeof(uint32_t)) != cudaSuccess) {
+	status = restoredClaims.empty()
+		? cudaMemset(g.d_depthIndex, 0xFF, nPix * sizeof(uint32_t))
+		: cudaMemcpy(g.d_depthIndex, restoredClaims.data(),
+		             nPix * sizeof(uint32_t), cudaMemcpyHostToDevice);
+	if (status != cudaSuccess) {
+		VERBOSE("CUDA fusion: depth-pixel claim initialization failed: %s", cudaGetErrorString(status));
 		impl_->FreeGpu(g);
 		return false;
 	}
@@ -234,19 +344,48 @@ bool FuseDepthMapsCUDA::UploadDepthData(
 	g.C[1] = (float)camera.C.y;
 	g.C[2] = (float)camera.C.z;
 
-	impl_->usedMemory += nPix * (4 + (bNeedNormal ? 12 : 0) + 4 + 4);
+	impl_->usedMemory += impl_->DepthDataBytes(g);
 	impl_->cache.emplace(idxImage, g);
 	impl_->lru.push_front(idxImage);
+	if (stateIt != impl_->hostDepthState.end()) {
+		impl_->hostDepthState.erase(stateIt);
+		impl_->touchedImages.insert(idxImage);
+	}
 	return true;
+}
+
+void FuseDepthMapsCUDA::SetPinnedImages(const IIndexArr& idxImages)
+{
+	std::lock_guard<std::mutex> lk(impl_->mtx);
+	impl_->pinnedImages.clear();
+	for (const IIndex idxImage : idxImages)
+		impl_->pinnedImages.insert(idxImage);
+	impl_->TrimCache(0);
+}
+
+bool FuseDepthMapsCUDA::PrepareFusionBuffers(size_t nPixels, size_t nNeighbors)
+{
+	if (nPixels == 0 || nPixels > (size_t)INT_MAX ||
+	    nNeighbors >= UINT32_MAX ||
+	    nPixels > UINT32_MAX / (nNeighbors + 1))
+		return false;
+	const size_t nViewSlots = nPixels * (nNeighbors + 1);
+	std::lock_guard<std::mutex> lk(impl_->mtx);
+	return impl_->EnsureTempCap(nPixels, nViewSlots);
 }
 
 void FuseDepthMapsCUDA::SetMaxMemory(size_t b)
 {
 	std::lock_guard<std::mutex> lk(impl_->mtx);
 	impl_->maxMemory = b;
+	impl_->TrimCache(0);
 }
 
-size_t FuseDepthMapsCUDA::GetUsedMemory() const { return impl_->usedMemory; }
+size_t FuseDepthMapsCUDA::GetUsedMemory() const
+{
+	std::lock_guard<std::mutex> lk(impl_->mtx);
+	return impl_->usedMemory + impl_->temporaryMemory;
+}
 
 // ------------------------- FuseOne -------------------------
 
@@ -272,8 +411,7 @@ bool FuseDepthMapsCUDA::FuseOne(
 		impl_->lru.push_front(idxImage);
 	}
 
-	// Build neighbor list (depthIndex disabled on neighbors: per-reference
-	// fusion is independent, so we don't need cross-fusion dedup).
+	// Preserve the depth-pixel claim maps to prevent duplicate points across references.
 	std::vector<GpuNeighborView> hNb;
 	hNb.reserve(neighbors.size());
 	for (IIndex nid : neighbors) {
@@ -283,7 +421,6 @@ bool FuseDepthMapsCUDA::FuseOne(
 			continue;
 		GpuNeighborView v;
 		v.data = it->second;
-		v.data.d_depthIndex = nullptr;
 		v.idxImage = nid;
 		hNb.push_back(v);
 	}
@@ -293,54 +430,60 @@ bool FuseDepthMapsCUDA::FuseOne(
 	const int N = (int)hNb.size();
 	const int W = pRef->width, H = pRef->height;
 	const size_t nPix = (size_t)W * (size_t)H;
-	if (nPix > UINT32_MAX / (size_t)(N + 1))
+	if (nPix > (size_t)INT_MAX || nPix > UINT32_MAX / (size_t)(N + 1))
 		return false;
-	// Each proposal can consume the reference view plus up to N neighbors, so the
-	// view pool must be sized for the worst-case slot count per pixel, not merely
-	// the minimum number of fused views.
 	const size_t nViewSlots = nPix * (size_t)(N + 1);
-	const size_t nInvalidSlots = nPix * (size_t)N;
-	if (nInvalidSlots > UINT32_MAX ||
-	    !impl_->EnsureTempCap(nPix, nViewSlots, nInvalidSlots))
+	if (nViewSlots > UINT32_MAX)
 		return false;
+
+	{
+		std::lock_guard<std::mutex> lk(impl_->mtx);
+		if (!impl_->TrimCache((size_t)N * sizeof(GpuNeighborView)) ||
+		    !impl_->EnsureTempCap(nPix, nViewSlots))
+			return false;
+	}
 
 	GpuNeighborView* d_nb = nullptr;
-	if (cudaMalloc(&d_nb, N * sizeof(GpuNeighborView)) != cudaSuccess)
+	if (cudaMalloc(&d_nb, (size_t)N * sizeof(GpuNeighborView)) != cudaSuccess) {
+		VERBOSE("CUDA fusion: failed to allocate neighbor descriptors");
 		return false;
+	}
 	if (cudaMemcpy(d_nb, hNb.data(), N * sizeof(GpuNeighborView), cudaMemcpyHostToDevice) != cudaSuccess) {
+		VERBOSE("CUDA fusion: failed to upload neighbor descriptors");
+		cudaFree(d_nb);
+		return false;
+	}
+	cudaError_t cudaStatus = cudaMemsetAsync(impl_->d_counts, 0, 6 * sizeof(uint32_t), stream);
+	if (cudaStatus != cudaSuccess) {
+		VERBOSE("CUDA fusion: failed to initialize diagnostic counters: %s", cudaGetErrorString(cudaStatus));
 		cudaFree(d_nb);
 		return false;
 	}
 
-	if (cudaMemset(impl_->d_viewPoolCounter, 0, sizeof(uint32_t)) != cudaSuccess ||
-	    cudaMemset(impl_->d_invalidCount, 0, sizeof(uint32_t)) != cudaSuccess ||
-	    cudaMemset(pRef->d_depthIndex, 0xFF, nPix * sizeof(uint32_t)) != cudaSuccess) {
-		cudaFree(d_nb);
-		return false;
-	}
-
-	// ---- Pass 1 ----
+	// Propose, atomically claim each participating depth pixel, invalidate
+	// conflicting unclaimed depths, then compact the accepted outputs.
 	launchFuseProposal(*pRef, d_nb, N, depthThresh, normalCosThresh, nMinViewsFuse,
-	                   impl_->d_proposals, impl_->d_viewPool, impl_->d_viewPoolCounter,
-	                   impl_->d_invalidDepths, impl_->d_invalidCount,
-	                   (uint32_t)nInvalidSlots,
-	                   (unsigned)idxImage, W, H, stream);
-	cudaError_t cudaStatus = cudaGetLastError();
-	if (cudaStatus == cudaSuccess)
-		cudaStatus = cudaStreamSynchronize(stream);
+	                   impl_->d_proposals, impl_->d_viewPool, impl_->d_counts,
+	                   W, H, stream);
+	cudaStatus = cudaGetLastError();
 	if (cudaStatus != cudaSuccess) {
 		VERBOSE("CUDA fusion kernel failed: %s", cudaGetErrorString(cudaStatus));
 		cudaFree(d_nb);
 		return false;
 	}
 
-	uint32_t nInvalid = 0;
-	if (cudaMemcpy(&nInvalid, impl_->d_invalidCount, sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+	launchClaimViews(*pRef, impl_->d_proposals,
+	                 impl_->d_viewPool, d_nb, N, (int)nPix,
+	                 impl_->d_counts, stream);
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		VERBOSE("CUDA depth-pixel claim kernel failed: %s", cudaGetErrorString(cudaStatus));
 		cudaFree(d_nb);
 		return false;
 	}
-	nInvalid = (uint32_t)MINF(nInvalid, (uint32_t)nInvalidSlots);
-	launchApplyInvalid(impl_->d_invalidDepths, nInvalid, d_nb, N, stream);
+
+	launchApplyInvalid(*pRef, d_nb, N, impl_->d_proposals,
+	                   depthThresh, normalCosThresh, impl_->d_counts, stream);
 	cudaStatus = cudaGetLastError();
 	if (cudaStatus != cudaSuccess) {
 		VERBOSE("CUDA invalid-depth kernel failed: %s", cudaGetErrorString(cudaStatus));
@@ -348,59 +491,62 @@ bool FuseDepthMapsCUDA::FuseOne(
 		return false;
 	}
 
-	FusionProposal* d_out = nullptr;
-	int* d_numOut = nullptr;
-	if (cudaMalloc(&d_out, nPix * sizeof(FusionProposal)) != cudaSuccess) {
-		cudaFree(d_nb);
-		return false;
-	}
-	if (cudaMalloc(&d_numOut, sizeof(int)) != cudaSuccess) {
-		cudaFree(d_out);
-		cudaFree(d_nb);
-		return false;
-	}
+	launchSelectValid(impl_->d_proposals, (int)nPix, impl_->d_viewPool,
+	                  impl_->d_out, impl_->d_outViewPool, impl_->d_counts, stream);
 
-	launchSelectValid(impl_->d_proposals, (int)nPix, d_out, d_numOut, stream);
-
-	int numSel = 0;
 	cudaStatus = cudaGetLastError();
-	if (cudaStatus == cudaSuccess)
-		cudaStatus = cudaMemcpy(&numSel, d_numOut, sizeof(int), cudaMemcpyDeviceToHost);
 	if (cudaStatus != cudaSuccess) {
 		VERBOSE("CUDA fusion selection failed: %s", cudaGetErrorString(cudaStatus));
-		cudaFree(d_out);
-		cudaFree(d_numOut);
 		cudaFree(d_nb);
 		return false;
 	}
 
-	if (numSel > 0) {
-		std::vector<FusionProposal> hOut((size_t)numSel);
-		if (cudaMemcpy(hOut.data(), d_out, (size_t)numSel * sizeof(FusionProposal), cudaMemcpyDeviceToHost) != cudaSuccess) {
+	uint32_t counts[6] = {};
+	cudaStatus = cudaMemcpy(counts, impl_->d_counts, sizeof(counts), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		VERBOSE("CUDA fusion: failed to download selection counters: %s", cudaGetErrorString(cudaStatus));
+		cudaFree(d_nb);
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> lk(impl_->mtx);
+		impl_->touchedImages.insert(idxImage);
+		for (const GpuNeighborView& neighbor : hNb)
+			impl_->touchedImages.insert(neighbor.idxImage);
+	}
+	if (counts[0] > nPix || counts[1] > nViewSlots) {
+		VERBOSE("CUDA fusion: invalid selection counters");
+		cudaFree(d_nb);
+		return false;
+	}
+
+	if (counts[0] > 0) {
+		std::vector<FusionProposal> hOut(counts[0]);
+		if (cudaMemcpy(hOut.data(), impl_->d_out, (size_t)counts[0] * sizeof(FusionProposal), cudaMemcpyDeviceToHost) != cudaSuccess) {
 			VERBOSE("CUDA fusion: failed to download proposals");
-			cudaFree(d_out);
-			cudaFree(d_numOut);
 			cudaFree(d_nb);
 			return false;
 		}
 
-		// Read the view pool. Conservative: copy the whole capacity.
-		std::vector<ViewEntry> hPool(impl_->capViewPool);
-		if (cudaMemcpy(hPool.data(), impl_->d_viewPool,
-		               impl_->capViewPool * sizeof(ViewEntry), cudaMemcpyDeviceToHost) != cudaSuccess) {
+		std::vector<ViewEntry> hPool(counts[1]);
+		if (cudaMemcpy(hPool.data(), impl_->d_outViewPool,
+		               (size_t)counts[1] * sizeof(ViewEntry), cudaMemcpyDeviceToHost) != cudaSuccess) {
 			VERBOSE("CUDA fusion: failed to download view-pool entries");
-			cudaFree(d_out);
-			cudaFree(d_numOut);
 			cudaFree(d_nb);
 			return false;
 		}
 
 		const Image& refImage = images[idxImage];
+		std::vector<SEACAVE::PairIdx> observations;
+		observations.reserve(counts[1]);
+		size_t duplicateObservations = 0;
+		size_t pointsWithOneView = 0;
+		size_t pointsWithTwoViews = 0;
+		size_t pointsWithThreeViews = 0;
+		size_t pointsWithFourOrMoreViews = 0;
 		for (const auto& p : hOut) {
 			if (p.viewBegin > hPool.size() || p.viewCount > hPool.size() - p.viewBegin) {
 				VERBOSE("CUDA fusion: proposal contains an invalid view-pool range");
-				cudaFree(d_out);
-				cudaFree(d_numOut);
 				cudaFree(d_nb);
 				return false;
 			}
@@ -411,9 +557,26 @@ bool FuseDepthMapsCUDA::FuseOne(
 			views.Reserve(p.viewCount);
 			weights.Reserve(p.viewCount);
 			for (uint32_t k = 0; k < p.viewCount; ++k) {
-				views.push_back(hPool[p.viewBegin + k].idxImage);
-				weights.push_back(hPool[p.viewBegin + k].weight);
+				const ViewEntry& entry = hPool[p.viewBegin + k];
+				if (entry.neighborIndex != NO_ID && entry.neighborIndex >= hNb.size()) {
+					VERBOSE("CUDA fusion: proposal contains an invalid neighbor index");
+					cudaFree(d_nb);
+					return false;
+				}
+				const IIndex idxView = entry.neighborIndex == NO_ID
+					? idxImage : hNb[entry.neighborIndex].idxImage;
+				observations.emplace_back(idxView, entry.pixelIndex);
+				const IIndex position = views.InsertSort(idxView);
+				weights.InsertAt(position, entry.weight);
 			}
+			if (p.viewCount == 1)
+				++pointsWithOneView;
+			else if (p.viewCount == 2)
+				++pointsWithTwoViews;
+			else if (p.viewCount == 3)
+				++pointsWithThreeViews;
+			else if (p.viewCount >= 4)
+				++pointsWithFourOrMoreViews;
 			pointcloud.pointViews.push_back(views);
 			pointcloud.pointWeights.push_back(weights);
 
@@ -421,15 +584,28 @@ bool FuseDepthMapsCUDA::FuseOne(
 				pointcloud.normals.push_back(Point3(p.normal[0], p.normal[1], p.normal[2]));
 
 			if (bEstimateColor) {
-				// Simple: take the reference pixel color (CPU fusion averages
-				// over all fused views).
+				// The CUDA path currently uses the reference pixel color.
 				pointcloud.colors.push_back(refImage.image(p.y, p.x));
 			}
 		}
+		{
+			std::lock_guard<std::mutex> lk(impl_->mtx);
+			for (const SEACAVE::PairIdx& observation : observations)
+				if (!impl_->outputObservations.emplace(observation).second)
+					++duplicateObservations;
+		}
+		VERBOSE("CUDA fusion stats image %u: neighbors=%d proposals=%u claim_success=%u claim_failures=%u rolled_back_pixels=%u occluded_depths_removed=%u output_points=%u views[1/2/3/4+]=%llu/%llu/%llu/%llu duplicate_observations=%llu",
+		        idxImage, N, counts[2], counts[2] - counts[3], counts[3], counts[4], counts[5], counts[0],
+		        (unsigned long long)pointsWithOneView,
+		        (unsigned long long)pointsWithTwoViews,
+		        (unsigned long long)pointsWithThreeViews,
+		        (unsigned long long)pointsWithFourOrMoreViews,
+		        (unsigned long long)duplicateObservations);
+	} else {
+		VERBOSE("CUDA fusion stats image %u: neighbors=%d proposals=%u claim_success=%u claim_failures=%u rolled_back_pixels=%u occluded_depths_removed=%u output_points=0 views[1/2/3/4+]=0/0/0/0 duplicate_observations=0",
+		        idxImage, N, counts[2], counts[2] - counts[3], counts[3], counts[4], counts[5]);
 	}
 
-	cudaFree(d_out);
-	cudaFree(d_numOut);
 	cudaFree(d_nb);
 	return true;
 }
