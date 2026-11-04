@@ -958,8 +958,8 @@ bool Scene::UndistortImages(String outputDir, String extension, float alpha,
 			const_cast<Image&>(img).ReleasePixels();
 		// Restore original orientation if the working copy was rotated to landscape
 		undistorted = img.ToOriginalOrientation(undistorted);
-		// const String stem = Util::getFileName(img.fileName);  ← 删掉原来这行
-		// const String outPath = outputDir + stem + extension;  ← 删掉原来这行
+		// const String stem = Util::getFileName(img.fileName);  //modify by herry
+		// const String outPath = outputDir + stem + extension;  //modify by herry
 		if (SaveImage(undistorted, outPath) && outImagePaths)
 			(*outImagePaths)[i] = outPath;
 	}

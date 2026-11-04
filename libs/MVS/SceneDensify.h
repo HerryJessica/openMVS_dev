@@ -37,6 +37,10 @@
 
 #include "SemiGlobalMatcher.h"
 
+#ifdef _USE_CUDA
+	#include "FuseDepthMapsCUDA.h"
+#endif
+
 
 // S T R U C T S ///////////////////////////////////////////////////
 
@@ -71,6 +75,10 @@ public:
 	bool AdjustConfidence(DepthData& depthDataRef, const IIndexArr& idxNeighbors);
 	void MergeDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
 	void FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
+#ifdef _USE_CUDA
+	// GPU-backed fusion of all valid depth-maps (FUSE_FILTER path).
+	bool FuseDepthMapsCUDA_Exec(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
+#endif
 	void DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
 
 	static DepthData ScaleDepthData(const DepthData& inputDeptData, float scale);
@@ -94,6 +102,8 @@ public:
 	#ifdef _USE_CUDA
 	// used internally to estimate the depth-maps using CUDA
 	CAutoPtr<MVS::CUDA::PatchMatch> pmCUDA;
+	// used internally to fuse depth-maps using CUDA
+	CAutoPtr<MVS::FuseDepthMapsCUDA> fuseCUDA;
 	#endif // _USE_CUDA
 };
 /*----------------------------------------------------------------*/

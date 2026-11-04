@@ -133,6 +133,7 @@ extern unsigned nIpolGapSize;
 extern int nIgnoreMaskLabel;
 extern unsigned nOptimize;
 extern unsigned nFuseFilter;
+extern bool bUseCUDAFusion; // enable GPU fusion (FUSE_FILTER only)
 extern unsigned nEstimateColors;
 extern unsigned nEstimateNormals;
 extern float fNCCThresholdKeep;
