@@ -1408,7 +1408,7 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 		pointcloud.normals.reserve(nPointsEstimate);
 		depthDataLoadFlags |= HeaderDepthDataRaw::HAS_NORMAL;
 	}
-	Util::Progress progress(_T("Fused depth-maps"), arrDepthData.size());
+	Util::Progress progress(_T("Dense fused depth-maps"), arrDepthData.size());
 	GET_LOGCONSOLE().Pause();
 	BoolArr fusedDMaps(arrDepthData.size());
 	fusedDMaps.Memset(0);
